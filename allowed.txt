@@ -1,0 +1,2 @@
+./allowed/system_info.sh
+printf 'hello from muse control\n'

@@ -1,0 +1,41 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Muse: Run local server",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": ["app.py"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PC_CONTROL_HOST": "127.0.0.1",
+          "PC_CONTROL_PORT": "5000"
+        }
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "muse-server",
+        "pattern": {
+          "regexp": "^(ERROR):\\s+(.*)$",
+          "severity": 1,
+          "message": 2
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "Uvicorn running|Started server process",
+          "endsPattern": "Application startup complete"
+        }
+      }
+    },
+    {
+      "label": "Muse: Test",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": ["-m", "pytest"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "group": "test",
+      "problemMatcher": []
+    }
+  ]
+}
