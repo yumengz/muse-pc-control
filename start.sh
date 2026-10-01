@@ -56,7 +56,24 @@ if (( ${#existing_pids[@]} > 0 )) && [[ -n "${existing_pids[1]}" ]]; then
     fi
 fi
 
-pkill -f "cloudflared tunnel.*127.0.0.1:$port" 2>/dev/null || true
+stale_tunnel_pids=("${(@f)$(pgrep -f "cloudflared tunnel.*127\\.0\\.0\\.1:$port" 2>/dev/null || true)}")
+if (( ${#stale_tunnel_pids[@]} > 0 )) && [[ -n "${stale_tunnel_pids[1]:-}" ]]; then
+    print "Stopping stale Cloudflare tunnels for port $port..."
+    kill -TERM "${stale_tunnel_pids[@]}" 2>/dev/null || true
+    for _ in {1..50}; do
+        pgrep -f "cloudflared tunnel.*127\\.0\\.0\\.1:$port" >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    stale_tunnel_pids=("${(@f)$(pgrep -f "cloudflared tunnel.*127\\.0\\.0\\.1:$port" 2>/dev/null || true)}")
+    if (( ${#stale_tunnel_pids[@]} > 0 )) && [[ -n "${stale_tunnel_pids[1]:-}" ]]; then
+        print "Stale tunnels did not stop gracefully; forcing them to exit..."
+        kill -KILL "${stale_tunnel_pids[@]}" 2>/dev/null || true
+    fi
+    if pgrep -f "cloudflared tunnel.*127\\.0\\.0\\.1:$port" >/dev/null 2>&1; then
+        print -u2 "Could not stop stale Cloudflare tunnels for port $port."
+        exit 1
+    fi
+fi
 
 runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/muse-pc-control.XXXXXX")
 server_log="$runtime_dir/server.log"
