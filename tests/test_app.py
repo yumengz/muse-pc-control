@@ -1,5 +1,6 @@
 import subprocess
 import threading
+from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -21,6 +22,16 @@ from approval_monitor import (
 )
 
 TOKEN = "test-token-that-is-definitely-at-least-32-characters"
+
+
+class ControlTestIdParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.controls: list[tuple[str, dict[str, str | None]]] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"button", "input", "select", "textarea"}:
+            self.controls.append((tag, dict(attrs)))
 
 
 @pytest.fixture(autouse=True)
@@ -381,6 +392,40 @@ def test_control_page_contains_new_bounded_controls(client):
     assert 'maxlength="16000"' not in html
 
 
+def test_mission_control_page_has_stable_selectors_on_every_control(client):
+    parser = ControlTestIdParser()
+    parser.feed(client.get("/").text)
+    assert parser.controls
+    missing = [attributes.get("id", tag) for tag, attributes in parser.controls if not attributes.get("data-testid")]
+    assert missing == []
+    test_ids = [attributes["data-testid"] for _, attributes in parser.controls]
+    assert len(test_ids) == len(set(test_ids))
+
+
+def test_mission_control_layout_supports_agent_mode_and_persisted_panels(client):
+    html = client.get("/?agent=1").text
+    for test_id in (
+        "mission-header",
+        "pending-approval-count",
+        "screenshot-refresh",
+        "screenshot-state",
+        "approval-overlay",
+        "approval-action-text",
+        "toggle-keyboard",
+        "toggle-command",
+        "toggle-scroll",
+        "toggle-ocr-watch",
+    ):
+        assert f'data-testid="{test_id}"' in html
+    assert ".approval.pending{display:block;position:fixed" in html
+    assert "new URLSearchParams(location.search).get('agent')==='1'" in html
+    assert "museControlPanels" in html
+    assert "localStorage.setItem(panelStateKey" in html
+    assert "animation:none!important;transition:none!important" in html
+    assert "lastScreenshotAt" in html
+    assert "Auto paused" in html
+
+
 def test_ocr_requires_positive_and_negative_buttons_on_same_row():
     words = [
         OCRWord("cancel", 95, 500, 400, 80, 30),
@@ -474,6 +519,35 @@ def test_approval_status_and_crop_require_auth(client, monkeypatch):
     image_response = client.get(f"/api/approval/{candidate.candidate_id}/image", headers=auth())
     assert image_response.status_code == 200
     assert image_response.content == b"focused-png"
+
+
+def test_structured_pending_approval_feed_requires_auth(client, monkeypatch):
+    candidate = approval_candidate()
+    monkeypatch.setattr(control, "scan_for_approval", lambda: candidate)
+    assert client.get("/api/approval/pending").status_code == 401
+    response = client.get("/api/approval/pending", headers=auth())
+    assert response.status_code == 200
+    assert response.json()["pending"] is True
+    assert response.json()["count"] == 1
+    assert response.json()["id"] == candidate.candidate_id
+    assert response.json()["action_text"] == candidate.ocr_text
+    assert response.json()["detected_at"].endswith("Z")
+    assert "image_url" not in response.json()
+    assert "crop_png" not in response.json()
+
+
+def test_structured_pending_approval_feed_reports_empty_state(client, monkeypatch):
+    monkeypatch.setattr(control, "scan_for_approval", lambda: None)
+    response = client.get("/api/approval/pending", headers=auth())
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "pending": False,
+        "count": 0,
+        "id": None,
+        "action_text": "",
+        "detected_at": None,
+    }
 
 
 def test_approval_decision_rechecks_prompt_before_clicking(client, monkeypatch):

@@ -28,6 +28,8 @@ Do not run `start.sh` and `start-dev.sh` simultaneously. Development mode intent
 
 ## Controller functions
 
+- **Mission-control layout:** a compact sticky header always shows connection state, pending-approval count, screenshot freshness, auto-refresh state, and a one-click screenshot refresh. Approval candidates appear in a fixed top-right overlay and never reflow the dashboard.
+- **Agent mode:** add `?agent=1` to the controller URL for denser spacing and disabled UI animations. Keyboard, command, scroll, and OCR-watch panels live behind labeled toolbar buttons; their expanded state persists in browser local storage.
 - **Keyboard shortcuts:** enter a validated combination such as `Cmd+A`, `Cmd+Shift+P`, or `Cmd+Option+D`. The API requires one or more recognized modifiers and exactly one recognized action key. **Clear focused field** performs `Cmd+A` followed by Backspace as one serialized operation.
 - **Reliable text:** the phone UI uses an atomic clipboard paste by default, preserving newlines and Unicode for up to 16,000 characters. The legacy `/api/type` keystroke endpoint remains available. Paste, type, key, hotkey, and clear-field operations share a server-side lock; a competing request receives `429` rather than interleaving. Successful text responses report the delivered character count, while over-limit input is rejected without truncation. Text contents are never written to the audit log.
 - **Allowlisted commands:** the UI loads exact entries from `allowed.txt` into a selector. It never accepts an arbitrary command string from the command panel. Output, timeout, and truncation limits remain enforced by the server.
@@ -109,6 +111,12 @@ Status:
 Screenshot:
 
     curl -H "Authorization: Bearer $PC_CONTROL_TOKEN" http://127.0.0.1:5001/api/screenshot -o screen.png
+
+  Lightweight structured approval feed (no screenshot transfer):
+
+    curl -H "Authorization: Bearer $PC_CONTROL_TOKEN" http://127.0.0.1:5001/api/approval/pending
+
+  The response reports `pending`, `count`, candidate `id`, redacted OCR `action_text`, and an ISO-8601 `detected_at` timestamp. The current monitor holds at most one focused approval candidate, so `count` is currently `0` or `1`.
 
 Run the sample script after confirming its exact entry exists in `allowed.txt`:
 
