@@ -22,6 +22,7 @@ from AppKit import NSWorkspace
 from PIL import Image
 
 OCR_INTERVAL_SECONDS = 1.5
+OCR_FALLBACK_INTERVAL_SECONDS = 6
 CANDIDATE_MAX_AGE_SECONDS = 30
 OCR_TIMEOUT_SECONDS = 8
 MAX_OCR_WIDTH = 1600
@@ -83,6 +84,7 @@ class ApprovalCandidate:
 
 _lock = threading.Lock()
 _last_scan_at = 0.0
+_last_ocr_at = 0.0
 _candidate: ApprovalCandidate | None = None
 _last_diagnostic_signature: tuple[object, ...] | None = None
 _scan_status: dict[str, str] = {"state": "starting", "frontmost_app": ""}
@@ -509,8 +511,11 @@ def build_accessibility_candidate(
 
 
 def scan_for_approval(*, force: bool = False) -> ApprovalCandidate | None:
-    global _candidate, _last_diagnostic_signature, _last_scan_at, _scan_status
-    with _lock:
+    global _candidate, _last_diagnostic_signature, _last_ocr_at, _last_scan_at, _scan_status
+    acquired = _lock.acquire(blocking=force)
+    if not acquired:
+        return _candidate if _candidate and _candidate.age_seconds <= CANDIDATE_MAX_AGE_SECONDS else None
+    try:
         now = time.monotonic()
         if not force and now - _last_scan_at < OCR_INTERVAL_SECONDS:
             if _candidate and _candidate.age_seconds <= CANDIDATE_MAX_AGE_SECONDS:
@@ -530,11 +535,16 @@ def scan_for_approval(*, force: bool = False) -> ApprovalCandidate | None:
         relevant_words: list[OCRWord] = []
         blue_ratios: list[tuple[str, int, int, float]] = []
         visual_pair: tuple[OCRWord, OCRWord] | None = None
+        ocr_skipped = False
         if accessibility_pair:
             detected = build_accessibility_candidate(
                 image, accessibility_pair, logical_width, logical_height, origin_x, origin_y
             )
+        elif not force and now - _last_ocr_at < OCR_FALLBACK_INTERVAL_SECONDS:
+            detected = None
+            ocr_skipped = True
         else:
+            _last_ocr_at = now
             words = run_ocr(encode_png(image))
             relevant_words = [
                 word for word in words if word.text in POSITIVE_LABELS | NEGATIVE_LABELS
@@ -601,8 +611,18 @@ def scan_for_approval(*, force: bool = False) -> ApprovalCandidate | None:
                 crop_png=detected.crop_png,
                 ocr_text=extract_action_text(detected.crop_png),
             )
+        if (
+            not force
+            and ocr_skipped
+            and detected is None
+            and _candidate
+            and _candidate.age_seconds <= CANDIDATE_MAX_AGE_SECONDS
+        ):
+            return _candidate
         _candidate = detected
         return _candidate
+    finally:
+        _lock.release()
 
 
 def current_candidate(candidate_id: str) -> ApprovalCandidate | None:

@@ -407,6 +407,7 @@ def test_unchanged_prompt_keeps_stable_candidate(monkeypatch):
     detected = approval_candidate(candidate_id="new-scan")
     monkeypatch.setattr(monitor, "_candidate", original)
     monkeypatch.setattr(monitor, "_last_scan_at", 0.0)
+    monkeypatch.setattr(monitor, "_last_ocr_at", 0.0)
     monkeypatch.setattr(monitor, "frontmost_application_name", lambda: "Visual Studio Code")
     monkeypatch.setattr(
         monitor,
@@ -419,3 +420,30 @@ def test_unchanged_prompt_keeps_stable_candidate(monkeypatch):
     monkeypatch.setattr(monitor, "find_accessibility_approval_pair", lambda buttons: (allow, cancel))
     monkeypatch.setattr(monitor, "build_accessibility_candidate", lambda *args: detected)
     assert monitor.scan_for_approval(force=False).candidate_id == "stable"
+
+
+def test_busy_approval_scan_returns_without_waiting(monkeypatch):
+    candidate = approval_candidate(candidate_id="cached")
+    monkeypatch.setattr(monitor, "_candidate", candidate)
+    monitor._lock.acquire()
+    try:
+        assert monitor.scan_for_approval(force=False) is candidate
+    finally:
+        monitor._lock.release()
+
+
+def test_visual_ocr_fallback_is_rate_limited(monkeypatch):
+    monkeypatch.setattr(monitor, "_candidate", None)
+    monkeypatch.setattr(monitor, "_last_scan_at", 0.0)
+    monkeypatch.setattr(monitor, "_last_ocr_at", monitor.time.monotonic())
+    monkeypatch.setattr(monitor, "frontmost_application_name", lambda: "Visual Studio Code")
+    monkeypatch.setattr(
+        monitor,
+        "capture_ocr_image",
+        lambda: (Mock(size=(1000, 700)), 1.0, 1000, 700, 0, 0),
+    )
+    monkeypatch.setattr(monitor, "accessibility_buttons", lambda: [])
+    run_ocr = Mock()
+    monkeypatch.setattr(monitor, "run_ocr", run_ocr)
+    assert monitor.scan_for_approval(force=False) is None
+    run_ocr.assert_not_called()

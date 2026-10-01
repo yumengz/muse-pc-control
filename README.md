@@ -33,6 +33,7 @@ Do not run `start.sh` and `start-dev.sh` simultaneously. Development mode intent
 - **Allowlisted commands:** the UI loads exact entries from `allowed.txt` into a selector. It never accepts an arbitrary command string from the command panel. Output, timeout, and truncation limits remain enforced by the server.
 - **Scrolling:** authenticated scroll requests are limited to 20 wheel clicks in either direction. Zero and out-of-range values are rejected.
 - **Full primary display:** the optional desktop stream captures the complete primary monitor. An auto-hidden macOS Dock is not drawn into screenshots until it is revealed; use the Toggle Dock shortcut when needed.
+- **Responsive polling:** desktop frames and approval scans never overlap within one browser page. Accessibility checks remain frequent, while expensive visual OCR fallback is rate-limited to prevent it from delaying the desktop stream.
 - **OCR text watches:** a bounded phrase can be watched in the VS Code window. Matching changes the browser title and may issue a browser notification. Text watches are notification-only and can never click, approve, or execute a command.
 
 ## Automatic startup and URL notification
