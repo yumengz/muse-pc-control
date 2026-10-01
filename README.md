@@ -28,8 +28,8 @@ Do not run `start.sh` and `start-dev.sh` simultaneously. Development mode intent
 
 ## Controller functions
 
-- **Keyboard shortcuts:** the phone UI provides validated combinations including **Cmd + backtick**, `Cmd+Shift+P`, `Cmd+N`, `Cmd+S`, copy/paste, and `Cmd+Option+D` for Dock visibility. The API requires one or more recognized modifiers and exactly one recognized action key.
-- **Reliable text:** authenticated text requests accept up to 16,000 characters and send them to macOS in bounded 500-character chunks. Typed contents are never written to the audit log.
+- **Keyboard shortcuts:** enter a validated combination such as `Cmd+A`, `Cmd+Shift+P`, or `Cmd+Option+D`. The API requires one or more recognized modifiers and exactly one recognized action key. **Clear focused field** performs `Cmd+A` followed by Backspace as one serialized operation.
+- **Reliable text:** the phone UI uses an atomic clipboard paste by default, preserving newlines and Unicode for up to 16,000 characters. The legacy `/api/type` keystroke endpoint remains available. Paste, type, key, hotkey, and clear-field operations share a server-side lock; a competing request receives `429` rather than interleaving. Successful text responses report the delivered character count, while over-limit input is rejected without truncation. Text contents are never written to the audit log.
 - **Allowlisted commands:** the UI loads exact entries from `allowed.txt` into a selector. It never accepts an arbitrary command string from the command panel. Output, timeout, and truncation limits remain enforced by the server.
 - **Scrolling:** authenticated scroll requests are limited to 20 wheel clicks in either direction. Zero and out-of-range values are rejected.
 - **Full primary display:** the optional desktop stream captures the complete primary monitor. An auto-hidden macOS Dock is not drawn into screenshots until it is revealed; use the Toggle Dock shortcut when needed.
@@ -62,6 +62,7 @@ Generate the token once during initial setup and keep `.env` readable only by th
 - Commands run for at most 30 seconds, and stdout/stderr responses are capped at 64 KiB each.
 - The bearer token is removed from command subprocess environments.
 - API request size, rates, coordinates, mouse buttons, text length, and special keys are bounded.
+- Keyboard and text requests use nonblocking backpressure: while one operation is being delivered, another receives `429` and must be retried after completion.
 - Keyboard combinations and scrolling are validated against strict key and distance limits.
 - OCR text watches only report a match; they have no click or command execution path.
 - While an approval prompt is pending, generic clicks, movement, typing, keys, shortcuts, and scrolling are blocked by the backend; only the focused Approve or Deny decision path remains available.

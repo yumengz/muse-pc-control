@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 from collections import defaultdict, deque
+from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Annotated, Literal
@@ -39,7 +40,7 @@ load_dotenv(BASE_DIR / ".env")
 ALLOWLIST_PATH = BASE_DIR / "allowed.txt"
 MAX_COMMAND_OUTPUT = 64 * 1024
 COMMAND_TIMEOUT_SECONDS = 30
-MAX_REQUEST_BYTES = 64 * 1024
+MAX_REQUEST_BYTES = 256 * 1024
 MAX_TEXT_LENGTH = 16_000
 TEXT_CHUNK_SIZE = 500
 RATE_LIMIT_REQUESTS = 180
@@ -73,6 +74,7 @@ if not logger.handlers:
 app = FastAPI(title="Muse PC Control", version="1.0.0", docs_url=None, redoc_url=None)
 _rate_lock = threading.Lock()
 _rate_events: dict[str, deque[float]] = defaultdict(deque)
+_keyboard_operation_lock = threading.Lock()
 _watch_lock = threading.Lock()
 _watch_phrase = ""
 _watch_last_scan_at = 0.0
@@ -102,6 +104,10 @@ class MoveRequest(BaseModel):
 class TypeRequest(BaseModel):
     text: str = Field(max_length=MAX_TEXT_LENGTH)
     interval: float = Field(default=0.01, ge=0, le=0.5)
+
+
+class PasteRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=MAX_TEXT_LENGTH)
 
 
 class KeyRequest(BaseModel):
@@ -240,6 +246,47 @@ def reject_if_approval_pending() -> None:
         raise HTTPException(status_code=409, detail="Use the focused Approve or Deny controls")
 
 
+def run_keyboard_operation(operation: Callable[..., None], *args: object) -> None:
+    if not _keyboard_operation_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="Another keyboard or text operation is still being delivered; retry after it completes",
+            headers={"Retry-After": "1"},
+        )
+    try:
+        operation(*args)
+    finally:
+        _keyboard_operation_lock.release()
+
+
+def type_text(text: str, interval: float) -> None:
+    for start in range(0, len(text), TEXT_CHUNK_SIZE):
+        chunk = text[start : start + TEXT_CHUNK_SIZE]
+        pyautogui.write(chunk, interval=interval)
+        if start + TEXT_CHUNK_SIZE < len(text):
+            time.sleep(0.03)
+
+
+def paste_text(text: str) -> None:
+    try:
+        subprocess.run(
+            ["/usr/bin/pbcopy"],
+            input=text.encode("utf-8"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise HTTPException(status_code=503, detail="Could not copy text to the macOS clipboard") from error
+    pyautogui.hotkey("command", "v", interval=0.05)
+
+
+def clear_focused_field() -> None:
+    pyautogui.hotkey("command", "a", interval=0.05)
+    pyautogui.press("backspace")
+
+
 def run_allowed_command(cmd: str) -> dict[str, object]:
     allowed = load_allowed_commands()
     if cmd not in allowed:
@@ -361,15 +408,33 @@ async def api_move(payload: MoveRequest, client: AuthClient):
 async def api_type(payload: TypeRequest, client: AuthClient):
     reject_if_approval_pending()
     try:
-        for start in range(0, len(payload.text), TEXT_CHUNK_SIZE):
-            chunk = payload.text[start : start + TEXT_CHUNK_SIZE]
-            await asyncio.to_thread(pyautogui.write, chunk, interval=payload.interval)
-            if start + TEXT_CHUNK_SIZE < len(payload.text):
-                await asyncio.sleep(0.03)
+        await asyncio.to_thread(run_keyboard_operation, type_text, payload.text, payload.interval)
     except pyautogui.FailSafeException as error:
         raise HTTPException(status_code=409, detail="PyAutoGUI fail-safe activated") from error
     logger.info("type client=%s character_count=%d", client, len(payload.text))
-    return {"ok": True, "character_count": len(payload.text)}
+    return {"ok": True, "method": "keystrokes", "character_count": len(payload.text)}
+
+
+@app.post("/api/paste")
+async def api_paste(payload: PasteRequest, client: AuthClient):
+    reject_if_approval_pending()
+    try:
+        await asyncio.to_thread(run_keyboard_operation, paste_text, payload.text)
+    except pyautogui.FailSafeException as error:
+        raise HTTPException(status_code=409, detail="PyAutoGUI fail-safe activated") from error
+    logger.info("paste client=%s character_count=%d", client, len(payload.text))
+    return {"ok": True, "method": "clipboard_paste", "character_count": len(payload.text)}
+
+
+@app.post("/api/clear-field")
+async def api_clear_field(client: AuthClient):
+    reject_if_approval_pending()
+    try:
+        await asyncio.to_thread(run_keyboard_operation, clear_focused_field)
+    except pyautogui.FailSafeException as error:
+        raise HTTPException(status_code=409, detail="PyAutoGUI fail-safe activated") from error
+    logger.info("clear_field client=%s", client)
+    return {"ok": True, "keys": ["command", "a", "backspace"]}
 
 
 @app.post("/api/key")
@@ -379,7 +444,7 @@ async def api_key(payload: KeyRequest, client: AuthClient):
     if key not in ALLOWED_KEYS:
         raise HTTPException(status_code=422, detail="Key is not allowed")
     try:
-        await asyncio.to_thread(pyautogui.press, key)
+        await asyncio.to_thread(run_keyboard_operation, pyautogui.press, key)
     except pyautogui.FailSafeException as error:
         raise HTTPException(status_code=409, detail="PyAutoGUI fail-safe activated") from error
     logger.info("key client=%s key=%s", client, key)
@@ -391,7 +456,7 @@ async def api_hotkey(payload: HotkeyRequest, client: AuthClient):
     reject_if_approval_pending()
     keys = validate_hotkey(payload.keys)
     try:
-        await asyncio.to_thread(pyautogui.hotkey, *keys, interval=0.05)
+        await asyncio.to_thread(run_keyboard_operation, lambda: pyautogui.hotkey(*keys, interval=0.05))
     except pyautogui.FailSafeException as error:
         raise HTTPException(status_code=409, detail="PyAutoGUI fail-safe activated") from error
     logger.info("hotkey client=%s keys=%s", client, "+".join(keys))
@@ -591,7 +656,7 @@ INDEX_HTML = r'''<!doctype html>
     main{max-width:1500px;margin:auto;padding:18px}.screen{position:relative;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#02060a;box-shadow:0 24px 70px #0008}
     #desktop{display:block;width:100%;height:auto;cursor:crosshair;min-height:300px;object-fit:contain}.empty{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);pointer-events:none}
     .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}.control-card{flex:1 1 420px;min-width:min(100%,320px);padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}.control-card h2{margin:0 0 10px;font-size:15px}.control-row{display:flex;gap:8px;flex-wrap:wrap}.control-row+ .control-row{margin-top:8px}.command-output{min-height:72px;max-height:220px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:#d9e7f3;font:13px ui-monospace,SFMono-Regular,Menlo,monospace}
-    input,button,select{border:1px solid var(--line);background:#0b1725;color:var(--text);border-radius:8px;padding:9px 11px}input,select{flex:1;min-width:200px}button{cursor:pointer}button:hover,select:hover{border-color:var(--accent)}
+    input,textarea,button,select{border:1px solid var(--line);background:#0b1725;color:var(--text);border-radius:8px;padding:9px 11px}input,textarea,select{flex:1;min-width:200px}textarea{min-height:120px;resize:vertical;white-space:pre-wrap}button{cursor:pointer}button:hover,select:hover,textarea:hover,input:hover{border-color:var(--accent)}
     .approval{display:none;padding:18px;border:2px solid #f6c85f;border-radius:14px;background:#271f0d;box-shadow:0 24px 100px #000}.approval.pending{display:block;position:fixed;z-index:100;top:16px;left:50%;transform:translateX(-50%);width:min(1100px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto}.approval img{display:block;width:100%;height:auto;margin:12px auto;border:1px solid var(--line);border-radius:8px}.ocr-preview{padding:12px;border:1px solid #6d5a28;border-radius:10px;background:#15130d}.ocr-preview strong{display:block;margin-bottom:7px}.ocr-preview pre{margin:0;max-height:130px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:#d9e7f3;font:13px ui-monospace,SFMono-Regular,Menlo,monospace}.approval-actions{display:grid;grid-template-columns:minmax(120px,.65fr) minmax(220px,1.35fr);align-items:end;gap:12px;position:sticky;bottom:0;background:#271f0d;padding-top:10px}.approval-actions button{font-weight:700}.approve{min-height:82px;background:#175f4d;font-size:26px}.deny{min-height:58px;background:#762f39;font-size:18px}.desktop-disabled{display:none}
     .approval-heading{display:flex;align-items:center;justify-content:space-between;gap:16px}.approval-heading strong{font-size:18px}.focus-setting{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px;white-space:nowrap}.focus-setting select{padding:7px 9px}@media(max-width:700px){header{align-items:flex-start}.header-actions{align-items:flex-end;flex-direction:column}.status{font-size:12px}.focus-setting{font-size:12px}}
     dialog{border:1px solid var(--line);border-radius:14px;background:var(--panel);color:var(--text);padding:24px;max-width:420px}dialog::backdrop{background:#02060add}.error{color:var(--danger);min-height:1.2em}.hint{color:var(--muted);font-size:13px}
@@ -603,7 +668,7 @@ INDEX_HTML = r'''<!doctype html>
     <section id="approval" class="approval" tabindex="-1"><div class="approval-heading"><strong>VS Code approval detected</strong><label class="focus-setting">Auto-focus <select class="auto-focus-duration" aria-label="Auto-focus approval cards"><option value="0">Off</option><option value="1">1 hour</option><option value="5">5 hours</option><option value="24">24 hours</option></select></label></div><p id="approvalText" class="hint"></p><img id="approvalImage" alt="Focused VS Code approval prompt"><div class="ocr-preview"><strong>OCR command/action preview</strong><pre id="approvalOcr">No readable text detected. Verify the image above.</pre></div><div class="approval-actions"><button id="denyApproval" class="deny">Deny</button><button id="approveApproval" class="approve">Approve</button></div></section>
     <div id="screen" class="screen desktop-disabled"><img id="desktop" alt="Live Mac desktop"><div id="empty" class="empty">Desktop stream is off to save bandwidth</div></div>
         <div class="toolbar">
-            <section class="control-card"><h2>Keyboard and text</h2><div class="control-row"><input id="typeText" maxlength="16000" placeholder="Text to type on the Mac"><button id="typeButton">Type text</button></div><div class="control-row"><button data-key="enter">Enter</button><button data-key="tab">Tab</button><button data-key="esc">Esc</button><select id="hotkey"><option value="command,`">Cmd+` Terminal</option><option value="command,shift,p">Cmd+Shift+P Palette</option><option value="command,n">Cmd+N</option><option value="command,s">Cmd+S</option><option value="command,option,d">Toggle Dock</option><option value="command,c">Cmd+C</option><option value="command,v">Cmd+V</option></select><button id="sendHotkey">Send shortcut</button></div></section>
+            <section class="control-card"><h2>Keyboard and text</h2><div class="control-row"><textarea id="typeText" placeholder="Paste multiline or Unicode text on the Mac (maximum 16,000 characters)"></textarea><button id="typeButton">Paste text</button></div><p id="textDelivery" class="hint">Clipboard paste is atomic and preserves newlines and Unicode.</p><div class="control-row"><button data-key="enter">Enter</button><button data-key="tab">Tab</button><button data-key="esc">Esc</button><button id="clearField">Clear focused field</button></div><div class="control-row"><input id="hotkey" value="Cmd+A" placeholder="Shortcut, for example Cmd+Shift+P" aria-label="Keyboard shortcut"><button id="sendHotkey">Send shortcut</button></div></section>
             <section class="control-card"><h2>Desktop</h2><div class="control-row"><button id="scrollUp">Scroll up</button><button id="scrollDown">Scroll down</button><button id="refresh">Enable full primary display</button></div><p class="hint">The capture includes the full primary display. macOS does not draw an auto-hidden Dock until it is revealed; use Toggle Dock when needed.</p></section>
             <section class="control-card"><h2>Exact allowlisted command</h2><div class="control-row"><select id="commandSelect" aria-label="Allowed command"><option value="">Loading allowlist…</option></select><button id="runCommand">Run</button></div><pre id="commandOutput" class="command-output">Select an exact reviewed entry from allowed.txt.</pre></section>
             <section class="control-card"><h2>OCR text watch (notification only)</h2><div class="control-row"><input id="watchText" maxlength="100" placeholder="Text to watch for in VS Code"><button id="startWatch">Watch</button><button id="stopWatch">Stop</button></div><p id="watchStatus" class="hint">No text watch configured. OCR watches never click automatically.</p></section>
@@ -630,14 +695,15 @@ async function loadCommands(){try{const response=await api('/api/commands'),data
 async function connect(event){event.preventDefault();const value=document.querySelector('#token').value.trim();localStorage.setItem('musePcToken',value);try{await api('/api/status');login.close();document.querySelector('#loginError').textContent='';startMonitoring();loadCommands()}catch(error){document.querySelector('#loginError').textContent=error.message}}
 function lock(){localStorage.removeItem('musePcToken');clearInterval(desktopTimer);clearInterval(approvalTimer);clearInterval(watchTimer);desktopTimer=null;approvalTimer=null;watchTimer=null;desktop.removeAttribute('src');approval.classList.remove('pending');empty.hidden=false;setStatus(false,'Locked');if(!login.open)login.showModal()}
 async function decide(decision){if(!candidateId)return;try{await api(`/api/approval/${candidateId}/decision`,{method:'POST',body:JSON.stringify({decision})});approval.classList.remove('pending');candidateId='';document.title='Muse PC Control';setTimeout(refreshApproval,500)}catch(error){setStatus(false,error.message);candidateId='';setTimeout(refreshApproval,500)}}
-async function sendHotkey(){const keys=document.querySelector('#hotkey').value.split(',');try{await api('/api/hotkey',{method:'POST',body:JSON.stringify({keys})});setStatus(true,`Sent ${keys.join('+')}`);setTimeout(refresh,180)}catch(error){setStatus(false,error.message)}}
+function parseHotkey(value){return value.split(/[+,]/).map(key=>key.trim()).filter(Boolean)}
+async function sendHotkey(){const keys=parseHotkey(document.querySelector('#hotkey').value);try{const response=await api('/api/hotkey',{method:'POST',body:JSON.stringify({keys})}),data=await response.json();setStatus(true,`Sent ${data.keys.join('+')}`);setTimeout(refresh,180)}catch(error){setStatus(false,error.message)}}
 async function runCommand(){const cmd=document.querySelector('#commandSelect').value,output=document.querySelector('#commandOutput');if(!cmd)return;output.textContent='Running exact allowlist entry…';try{const response=await api('/api/command',{method:'POST',body:JSON.stringify({cmd})}),data=await response.json();output.textContent=`Exit: ${data.returncode??'timeout'}${data.truncated?' · output truncated':''}\n${data.stdout||''}${data.stderr?`\nSTDERR:\n${data.stderr}`:''}`;setStatus(data.ok,data.ok?'Command completed':'Command failed')}catch(error){output.textContent=error.message;setStatus(false,error.message)}}
 async function refreshWatch(){try{const response=await api('/api/watch/text/status'),data=await response.json(),statusText=document.querySelector('#watchStatus');if(!data.ok){statusText.textContent=data.detail||'OCR watch scan failed';return}if(!data.enabled){statusText.textContent='No text watch configured. OCR watches never click automatically.';watchWasMatched=false;return}statusText.textContent=data.matched?`Matched: ${data.text}`:`Watching for: ${data.text}`;if(data.matched&&!watchWasMatched){document.title='Text watch matched · Muse PC Control';if('Notification'in window&&Notification.permission==='granted')new Notification('Muse text watch matched',{body:data.text})}watchWasMatched=data.matched}catch(error){document.querySelector('#watchStatus').textContent=error.message}}
 async function configureWatch(enabled){const text=document.querySelector('#watchText').value.trim();if(enabled&&text.length<2){setStatus(false,'Enter at least two characters to watch for');return}try{await api('/api/watch/text',{method:'POST',body:JSON.stringify({text:enabled?text:'off',enabled})});clearInterval(watchTimer);watchWasMatched=false;if(enabled){if('Notification'in window&&Notification.permission==='default')Notification.requestPermission();watchTimer=setInterval(refreshWatch,3000);refreshWatch()}else{watchTimer=null;document.querySelector('#watchStatus').textContent='No text watch configured. OCR watches never click automatically.';document.title='Muse PC Control'}}catch(error){setStatus(false,error.message)}}
 desktop.addEventListener('click',async event=>{if(candidateId){setStatus(false,'Use the focused Approve or Deny controls');return}const rect=desktop.getBoundingClientRect();try{await api('/api/click',{method:'POST',body:JSON.stringify({x:event.clientX-rect.left,y:event.clientY-rect.top,image_width:rect.width,image_height:rect.height,button:'left'})});setTimeout(refresh,180)}catch(error){setStatus(false,error.message)}});
-document.querySelector('#typeButton').onclick=async()=>{const field=document.querySelector('#typeText');try{await api('/api/type',{method:'POST',body:JSON.stringify({text:field.value})});field.value=''}catch(error){setStatus(false,error.message)}};
+document.querySelector('#typeButton').onclick=async()=>{const field=document.querySelector('#typeText'),delivery=document.querySelector('#textDelivery'),text=field.value;if(!text.length){setStatus(false,'Enter text to paste');return}if(text.length>16000){setStatus(false,`Text is ${text.length} characters; the limit is 16000`);return}try{const response=await api('/api/paste',{method:'POST',body:JSON.stringify({text})}),data=await response.json();delivery.textContent=`Delivered ${data.character_count} characters by atomic clipboard paste.`;setStatus(true,`Pasted ${data.character_count} characters`);field.value='';setTimeout(refresh,180)}catch(error){delivery.textContent=error.message;setStatus(false,error.message)}};
 document.querySelectorAll('[data-key]').forEach(button=>button.onclick=()=>api('/api/key',{method:'POST',body:JSON.stringify({key:button.dataset.key})}).catch(error=>setStatus(false,error.message)));
-document.querySelector('#sendHotkey').onclick=sendHotkey;document.querySelector('#scrollUp').onclick=()=>api('/api/scroll',{method:'POST',body:JSON.stringify({clicks:6})}).then(()=>setTimeout(refresh,180)).catch(error=>setStatus(false,error.message));document.querySelector('#scrollDown').onclick=()=>api('/api/scroll',{method:'POST',body:JSON.stringify({clicks:-6})}).then(()=>setTimeout(refresh,180)).catch(error=>setStatus(false,error.message));document.querySelector('#runCommand').onclick=runCommand;document.querySelector('#startWatch').onclick=()=>configureWatch(true);document.querySelector('#stopWatch').onclick=()=>configureWatch(false);
+document.querySelector('#clearField').onclick=async()=>{try{await api('/api/clear-field',{method:'POST'});setStatus(true,'Cleared focused field');setTimeout(refresh,180)}catch(error){setStatus(false,error.message)}};document.querySelector('#sendHotkey').onclick=sendHotkey;document.querySelector('#scrollUp').onclick=()=>api('/api/scroll',{method:'POST',body:JSON.stringify({clicks:6})}).then(()=>setTimeout(refresh,180)).catch(error=>setStatus(false,error.message));document.querySelector('#scrollDown').onclick=()=>api('/api/scroll',{method:'POST',body:JSON.stringify({clicks:-6})}).then(()=>setTimeout(refresh,180)).catch(error=>setStatus(false,error.message));document.querySelector('#runCommand').onclick=runCommand;document.querySelector('#startWatch').onclick=()=>configureWatch(true);document.querySelector('#stopWatch').onclick=()=>configureWatch(false);
 document.querySelector('#refresh').onclick=()=>{desktopEnabled=!desktopEnabled;document.querySelector('#screen').classList.toggle('desktop-disabled',!desktopEnabled);document.querySelector('#refresh').textContent=desktopEnabled?'Stop desktop stream':'Enable full primary display';clearInterval(desktopTimer);desktopTimer=desktopEnabled?setInterval(refresh,1500):null;if(desktopEnabled)refresh()};autoFocusDurations.forEach(select=>select.onchange=configureAutoFocus);document.querySelector('#approveApproval').onclick=()=>decide('approve');document.querySelector('#denyApproval').onclick=()=>decide('deny');document.querySelector('#logout').onclick=lock;document.querySelector('#connect').onclick=connect;
 if(token()){api('/api/status').then(()=>{login.close();startMonitoring();loadCommands()}).catch(lock)}else login.showModal();
 </script>

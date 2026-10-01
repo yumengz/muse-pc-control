@@ -1,4 +1,5 @@
 import subprocess
+import threading
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -30,6 +31,7 @@ def configured_token(monkeypatch):
     monkeypatch.setattr(control, "_watch_last_scan_at", 0.0)
     monkeypatch.setattr(control, "_watch_last_text", "")
     monkeypatch.setattr(control, "approval_pending", lambda: False)
+    monkeypatch.setattr(control, "_keyboard_operation_lock", threading.Lock())
 
 
 @pytest.fixture
@@ -66,6 +68,8 @@ def test_api_requires_bearer_token(client):
 
 
 def test_new_control_apis_require_bearer_token(client):
+    assert client.post("/api/paste", json={"text": "private"}).status_code == 401
+    assert client.post("/api/clear-field").status_code == 401
     assert client.post("/api/hotkey", json={"keys": ["command", "n"]}).status_code == 401
     assert client.post("/api/scroll", json={"clicks": 1}).status_code == 401
     assert client.get("/api/commands").status_code == 401
@@ -177,6 +181,106 @@ def test_long_text_is_sent_in_bounded_chunks(client, monkeypatch):
         "x" * control.TEXT_CHUNK_SIZE,
         "x" * 17,
     ]
+    assert response.json() == {
+        "ok": True,
+        "method": "keystrokes",
+        "character_count": len(text),
+    }
+
+
+def test_paste_preserves_unicode_and_newlines_atomically(client, monkeypatch):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0)
+
+    hotkey = Mock()
+    monkeypatch.setattr(control.subprocess, "run", run)
+    monkeypatch.setattr(control.pyautogui, "hotkey", hotkey)
+    text = "第一行\nemoji: 🧭\nthird line"
+    response = client.post("/api/paste", headers=auth(), json={"text": text})
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "method": "clipboard_paste",
+        "character_count": len(text),
+    }
+    assert calls[0][0] == ["/usr/bin/pbcopy"]
+    assert calls[0][1]["input"] == text.encode("utf-8")
+    hotkey.assert_called_once_with("command", "v", interval=0.05)
+
+
+def test_paste_log_does_not_echo_text(client, monkeypatch, caplog):
+    monkeypatch.setattr(
+        control.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0),
+    )
+    monkeypatch.setattr(control.pyautogui, "hotkey", Mock())
+    secret_text = "do-not-log-this-pasted-text"
+    response = client.post("/api/paste", headers=auth(), json={"text": secret_text})
+    assert response.status_code == 200
+    assert secret_text not in caplog.text
+
+
+def test_keyboard_operation_backpressure_prevents_interleaving(client, monkeypatch):
+    started = threading.Event()
+    finish = threading.Event()
+    first_response = []
+
+    def blocking_write(text, interval):
+        started.set()
+        assert finish.wait(timeout=2)
+
+    monkeypatch.setattr(control.pyautogui, "write", blocking_write)
+
+    def send_first():
+        first_response.append(client.post("/api/type", headers=auth(), json={"text": "first"}))
+
+    worker = threading.Thread(target=send_first)
+    worker.start()
+    assert started.wait(timeout=2)
+    busy = client.post("/api/paste", headers=auth(), json={"text": "second"})
+    assert busy.status_code == 429
+    assert "still being delivered" in busy.json()["detail"]
+    assert busy.headers["retry-after"] == "1"
+    assert not first_response
+    finish.set()
+    worker.join(timeout=2)
+    assert first_response[0].status_code == 200
+
+
+def test_clear_field_is_one_serialized_operation(client, monkeypatch):
+    actions = []
+    monkeypatch.setattr(
+        control.pyautogui,
+        "hotkey",
+        lambda *keys, **kwargs: actions.append(("hotkey", keys, kwargs)),
+    )
+    monkeypatch.setattr(control.pyautogui, "press", lambda key: actions.append(("press", key)))
+    response = client.post("/api/clear-field", headers=auth())
+    assert response.status_code == 200
+    assert actions == [
+        ("hotkey", ("command", "a"), {"interval": 0.05}),
+        ("press", "backspace"),
+    ]
+
+
+def test_text_over_limit_is_rejected_without_delivery(client, monkeypatch):
+    write = Mock()
+    hotkey = Mock()
+    monkeypatch.setattr(control.pyautogui, "write", write)
+    monkeypatch.setattr(control.pyautogui, "hotkey", hotkey)
+    text = "x" * (control.MAX_TEXT_LENGTH + 1)
+    typed = client.post("/api/type", headers=auth(), json={"text": text})
+    pasted = client.post("/api/paste", headers=auth(), json={"text": text})
+    assert typed.status_code == 422
+    assert pasted.status_code == 422
+    assert str(control.MAX_TEXT_LENGTH) in str(typed.json())
+    assert str(control.MAX_TEXT_LENGTH) in str(pasted.json())
+    write.assert_not_called()
+    hotkey.assert_not_called()
 
 
 def test_hotkey_requires_modifier_and_one_supported_action(client, monkeypatch):
@@ -194,6 +298,15 @@ def test_hotkey_requires_modifier_and_one_supported_action(client, monkeypatch):
     assert client.post("/api/hotkey", headers=auth(), json={"keys": ["cmd", "unsupported"]}).status_code == 422
 
 
+def test_hotkey_supports_cmd_a(client, monkeypatch):
+    hotkey = Mock()
+    monkeypatch.setattr(control.pyautogui, "hotkey", hotkey)
+    response = client.post("/api/hotkey", headers=auth(), json={"keys": ["Cmd", "A"]})
+    assert response.status_code == 200
+    assert response.json()["keys"] == ["command", "a"]
+    hotkey.assert_called_once_with("command", "a", interval=0.05)
+
+
 def test_scroll_is_bounded_and_zero_is_rejected(client, monkeypatch):
     scroll = Mock()
     monkeypatch.setattr(control.pyautogui, "scroll", scroll)
@@ -206,13 +319,18 @@ def test_scroll_is_bounded_and_zero_is_rejected(client, monkeypatch):
 
 def test_pending_approval_blocks_generic_input(client, monkeypatch):
     hotkey = Mock()
+    run = Mock()
     monkeypatch.setattr(control, "approval_pending", lambda: True)
     monkeypatch.setattr(control.pyautogui, "hotkey", hotkey)
+    monkeypatch.setattr(control.subprocess, "run", run)
     response = client.post(
         "/api/hotkey", headers=auth(), json={"keys": ["command", "n"]}
     )
     assert response.status_code == 409
+    assert client.post("/api/paste", headers=auth(), json={"text": "blocked"}).status_code == 409
+    assert client.post("/api/clear-field", headers=auth()).status_code == 409
     hotkey.assert_not_called()
+    run.assert_not_called()
 
 
 def test_invalid_special_key_is_rejected(client):
@@ -247,8 +365,20 @@ def test_text_watch_notifies_without_clicking(client, monkeypatch):
 
 def test_control_page_contains_new_bounded_controls(client):
     html = client.get("/").text
-    for control_id in ("hotkey", "scrollUp", "scrollDown", "commandSelect", "watchText"):
+    for control_id in (
+        "typeText",
+        "textDelivery",
+        "clearField",
+        "hotkey",
+        "scrollUp",
+        "scrollDown",
+        "commandSelect",
+        "watchText",
+    ):
         assert f'id="{control_id}"' in html
+    assert '<textarea id="typeText"' in html
+    assert "api('/api/paste'" in html
+    assert 'maxlength="16000"' not in html
 
 
 def test_ocr_requires_positive_and_negative_buttons_on_same_row():
