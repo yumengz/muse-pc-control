@@ -26,6 +26,15 @@ The development launcher stops an existing reload server or listener on the conf
 
 Do not run `start.sh` and `start-dev.sh` simultaneously. Development mode intentionally creates no Cloudflare tunnel; use `http://127.0.0.1:5001` locally.
 
+## Controller functions
+
+- **Keyboard shortcuts:** the phone UI provides validated combinations including **Cmd + backtick**, `Cmd+Shift+P`, `Cmd+N`, `Cmd+S`, copy/paste, and `Cmd+Option+D` for Dock visibility. The API requires one or more recognized modifiers and exactly one recognized action key.
+- **Reliable text:** authenticated text requests accept up to 16,000 characters and send them to macOS in bounded 500-character chunks. Typed contents are never written to the audit log.
+- **Allowlisted commands:** the UI loads exact entries from `allowed.txt` into a selector. It never accepts an arbitrary command string from the command panel. Output, timeout, and truncation limits remain enforced by the server.
+- **Scrolling:** authenticated scroll requests are limited to 20 wheel clicks in either direction. Zero and out-of-range values are rejected.
+- **Full primary display:** the optional desktop stream captures the complete primary monitor. An auto-hidden macOS Dock is not drawn into screenshots until it is revealed; use the Toggle Dock shortcut when needed.
+- **OCR text watches:** a bounded phrase can be watched in the VS Code window. Matching changes the browser title and may issue a browser notification. Text watches are notification-only and can never click, approve, or execute a command.
+
 ## Automatic startup and URL notification
 
 Run `./install-autostart.sh` once to install a per-user macOS LaunchAgent. It starts `start.sh` automatically after the user logs into the graphical Aqua session and restarts it if it exits. It intentionally does not run before login because Screen Recording, Accessibility, Messages, and desktop automation require a logged-in user session.
@@ -52,6 +61,9 @@ Generate the token once during initial setup and keep `.env` readable only by th
 - Commands run for at most 30 seconds, and stdout/stderr responses are capped at 64 KiB each.
 - The bearer token is removed from command subprocess environments.
 - API request size, rates, coordinates, mouse buttons, text length, and special keys are bounded.
+- Keyboard combinations and scrolling are validated against strict key and distance limits.
+- OCR text watches only report a match; they have no click or command execution path.
+- While an approval prompt is pending, generic clicks, movement, typing, keys, shortcuts, and scrolling are blocked by the backend; only the focused Approve or Deny decision path remains available.
 - Commands and control actions are timestamped in `audit.log`; tokens and typed text contents are not logged.
 - PyAutoGUI fail-safe is enabled. Move the physical pointer to a screen corner to abort automation.
 
@@ -115,6 +127,8 @@ The literal safe greeting is another default allowlist entry:
 Prefer a fixed, reviewed, non-interactive script in `allowed/`. Add only its exact invocation to `allowed.txt`. Never approve a shell, interpreter, downloader, package manager, broad prefix, or command containing user-controlled arguments.
 
 Changing `./allowed/system_info.sh` to `./allowed/system_info.sh; another-command` is rejected because it is not an exact allowlist entry.
+
+The phone command panel is populated by the authenticated `GET /api/commands` endpoint and submits the selected literal entry to `POST /api/command`. Editing browser markup cannot bypass the backend's exact-match check.
 
 ## VS Code approval monitor
 

@@ -358,6 +358,11 @@ def extract_action_text(png: bytes) -> str:
     return redact_ocr_text(normalized)[:1000]
 
 
+def scan_vscode_text() -> str:
+    image, _, _, _, _, _ = capture_ocr_image()
+    return extract_action_text(encode_png(image))
+
+
 def vscode_window_info() -> dict[object, object]:
     application = vscode_application()
     if not application:
@@ -607,6 +612,11 @@ def current_candidate(candidate_id: str) -> ApprovalCandidate | None:
         if _candidate.age_seconds > CANDIDATE_MAX_AGE_SECONDS:
             return None
         return _candidate
+
+
+def approval_pending() -> bool:
+    with _lock:
+        return bool(_candidate and _candidate.age_seconds <= CANDIDATE_MAX_AGE_SECONDS)
 
 
 def approval_scan_status() -> dict[str, str]:

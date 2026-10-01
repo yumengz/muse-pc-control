@@ -26,6 +26,10 @@ TOKEN = "test-token-that-is-definitely-at-least-32-characters"
 def configured_token(monkeypatch):
     monkeypatch.setenv("PC_CONTROL_TOKEN", TOKEN)
     control._rate_events.clear()
+    monkeypatch.setattr(control, "_watch_phrase", "")
+    monkeypatch.setattr(control, "_watch_last_scan_at", 0.0)
+    monkeypatch.setattr(control, "_watch_last_text", "")
+    monkeypatch.setattr(control, "approval_pending", lambda: False)
 
 
 @pytest.fixture
@@ -59,6 +63,14 @@ def approval_candidate(
 def test_api_requires_bearer_token(client):
     assert client.get("/api/status").status_code == 401
     assert client.get("/api/status", headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+
+def test_new_control_apis_require_bearer_token(client):
+    assert client.post("/api/hotkey", json={"keys": ["command", "n"]}).status_code == 401
+    assert client.post("/api/scroll", json={"clicks": 1}).status_code == 401
+    assert client.get("/api/commands").status_code == 401
+    assert client.post("/api/watch/text", json={"text": "done", "enabled": True}).status_code == 401
+    assert client.get("/api/watch/text/status").status_code == 401
 
 
 def test_status_reports_local_machine(client):
@@ -154,9 +166,89 @@ def test_type_log_does_not_echo_text(client, monkeypatch, caplog):
     writer.assert_called_once_with(secret_text, interval=0.01)
 
 
+def test_long_text_is_sent_in_bounded_chunks(client, monkeypatch):
+    writer = Mock()
+    monkeypatch.setattr(control.pyautogui, "write", writer)
+    text = "x" * (control.TEXT_CHUNK_SIZE * 2 + 17)
+    response = client.post("/api/type", headers=auth(), json={"text": text, "interval": 0})
+    assert response.status_code == 200
+    assert [call.args[0] for call in writer.call_args_list] == [
+        "x" * control.TEXT_CHUNK_SIZE,
+        "x" * control.TEXT_CHUNK_SIZE,
+        "x" * 17,
+    ]
+
+
+def test_hotkey_requires_modifier_and_one_supported_action(client, monkeypatch):
+    hotkey = Mock()
+    monkeypatch.setattr(control.pyautogui, "hotkey", hotkey)
+    response = client.post(
+        "/api/hotkey", headers=auth(), json={"keys": ["cmd", "shift", "p"]}
+    )
+    assert response.status_code == 200
+    assert response.json()["keys"] == ["command", "shift", "p"]
+    hotkey.assert_called_once_with("command", "shift", "p", interval=0.05)
+
+    assert client.post("/api/hotkey", headers=auth(), json={"keys": ["p", "n"]}).status_code == 422
+    assert client.post("/api/hotkey", headers=auth(), json={"keys": ["cmd", "p", "n"]}).status_code == 422
+    assert client.post("/api/hotkey", headers=auth(), json={"keys": ["cmd", "unsupported"]}).status_code == 422
+
+
+def test_scroll_is_bounded_and_zero_is_rejected(client, monkeypatch):
+    scroll = Mock()
+    monkeypatch.setattr(control.pyautogui, "scroll", scroll)
+    response = client.post("/api/scroll", headers=auth(), json={"clicks": -6})
+    assert response.status_code == 200
+    scroll.assert_called_once_with(-6)
+    assert client.post("/api/scroll", headers=auth(), json={"clicks": 0}).status_code == 422
+    assert client.post("/api/scroll", headers=auth(), json={"clicks": 21}).status_code == 422
+
+
+def test_pending_approval_blocks_generic_input(client, monkeypatch):
+    hotkey = Mock()
+    monkeypatch.setattr(control, "approval_pending", lambda: True)
+    monkeypatch.setattr(control.pyautogui, "hotkey", hotkey)
+    response = client.post(
+        "/api/hotkey", headers=auth(), json={"keys": ["command", "n"]}
+    )
+    assert response.status_code == 409
+    hotkey.assert_not_called()
+
+
 def test_invalid_special_key_is_rejected(client):
     response = client.post("/api/key", headers=auth(), json={"key": "not-a-real-key"})
     assert response.status_code == 422
+
+
+def test_command_list_contains_only_exact_allowlist_entries(client, monkeypatch, tmp_path: Path):
+    allowed = tmp_path / "allowed.txt"
+    allowed.write_text("# comment\nprintf 'safe\\n'\n./allowed/system_info.sh\n", encoding="utf-8")
+    monkeypatch.setattr(control, "ALLOWLIST_PATH", allowed)
+    response = client.get("/api/commands", headers=auth())
+    assert response.status_code == 200
+    assert response.json()["commands"] == ["./allowed/system_info.sh", "printf 'safe\\n'"]
+
+
+def test_text_watch_notifies_without_clicking(client, monkeypatch):
+    click = Mock()
+    monkeypatch.setattr(control.pyautogui, "click", click)
+    monkeypatch.setattr(control, "scan_vscode_text", lambda: "Build completed successfully")
+    configured = client.post(
+        "/api/watch/text",
+        headers=auth(),
+        json={"text": "build completed", "enabled": True},
+    )
+    assert configured.status_code == 200
+    status_response = client.get("/api/watch/text/status", headers=auth())
+    assert status_response.status_code == 200
+    assert status_response.json()["matched"] is True
+    click.assert_not_called()
+
+
+def test_control_page_contains_new_bounded_controls(client):
+    html = client.get("/").text
+    for control_id in ("hotkey", "scrollUp", "scrollDown", "commandSelect", "watchText"):
+        assert f'id="{control_id}"' in html
 
 
 def test_ocr_requires_positive_and_negative_buttons_on_same_row():
